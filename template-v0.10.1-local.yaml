@@ -415,7 +415,7 @@ Mappings:
         582441423537.dkr.ecr.us-east-1.amazonaws.com/lambda-function-agg:v0.10.1
     AirflowContainerImage:
       ImageUri: >-
-        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.1
+        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.2
     ClusterModelPart1ContainerImage:
       ImageUri: >-
         582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-embedding-ecs:v0.10.1
@@ -424,7 +424,7 @@ Mappings:
         582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-flow-ecs:v0.10.1
     WebContainerImage:
       ImageUri: >-
-        582441423537.dkr.ecr.us-east-2.amazonaws.com/cytech:v0.10.1
+        582441423537.dkr.ecr.us-east-2.amazonaws.com/cytech:v0.10.2
     NginxContainerImage:
       ImageUri: >-
         582441423537.dkr.ecr.us-east-2.amazonaws.com/cytech-nginx:latest
