@@ -4,6 +4,11 @@ Metadata:
     ParameterGroups:
 
     - Label:
+        default: Cloudformation Role Setup
+      Parameters:
+      - CloudFormationRoleArn
+
+    - Label:
         default: Pipeline components
       Parameters:
       - DisableTech
@@ -98,6 +103,12 @@ Metadata:
       - DbPassword
 
 Parameters:
+
+  CloudFormationRoleArn:
+    Type: String
+    Description: Cloud formation Role ARN that will be used to create the current stack
+    AllowedPattern: ^arn:aws:iam::[0-9]*:role\/[a-zA-Z0-9:\/_-]+$
+    ConstraintDescription: The value must be a valid ARN
 
   DisableTech:
     Type: String
@@ -446,15 +457,15 @@ Mappings:
     UI-ENTITIES-TABLE-FILE-PATH:
       Value: >-
         scratch/user_node_feature.json
-    
+
     NODE-FEATURE-FILE:
       Value: >-
         node_feature/node_feature.json
-    
+
     CLUSTER-CONFIG-PREFIX:
       Value: >-
         clustering_agent/
-    
+
     VOLUME-SERVICE-PLATFORM:
       Value: >-
         AWS
@@ -549,6 +560,1224 @@ Resources:
           - Fn::Split:
             - /
             - !Ref AWS::StackId
+
+  # CloudFormationRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: '2012-10-17'
+  #       Statement:
+  #       - Effect: Allow
+  #         Principal:
+  #           Service: lambda.amazonaws.com
+  #         Action: sts:AssumeRole
+  #     Policies:
+  #     - PolicyName: !Sub "${AWS::StackName}-AllowECS"
+  #       PolicyDocument:
+  #         Version: '2012-10-17'
+  #         Statement:
+  #         - Effect: Allow
+  #           Action:
+  #           - ecs:*
+  #           - ec2:*
+  #           - ecs:*
+  #           - elasticloadbalancing:*
+  #           - lambda:*
+  #           - cloudwatch:*
+  #           - cloudformation:*
+  #           - autoscaling:*
+  #           - logs:*
+  #           - route53:*
+  #           - s3:*
+  #           - servicediscovery:*
+  #           - ssm:GetParameters
+  #           - events:*
+  #           - iam:*
+  #           Resource: '*'
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-AllowECS"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecs:*
+            Resource: '*'
+      - PolicyName: !Sub "${AWS::StackName}-IAM-passrole"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - iam:PassRole
+            Resource: !Ref CloudFormationRoleArn
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  autoUpdateStack:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}_auto_update_stack
+      Description: !Sub
+      - Stack ${AWS::StackName} Function ${ResourceName}
+      - ResourceName: autoUpdateStack
+      InlineCode: |
+        import subprocess
+        import sys
+        import os
+        import json
+        import time
+
+        import boto3
+        from botocore.exceptions import ClientError
+        import requests
+        import requests.adapters
+        from requests.auth import HTTPBasicAuth
+
+        # Install ijson pip library to handle large json input files
+        os.makedirs("/tmp/pylib", exist_ok=True)
+        os.makedirs("/tmp/nltk_download", exist_ok=True)
+        subprocess.call('pip install ruamel.yaml -t /tmp/pylib/ --no-cache-dir'.split(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        sys.path.insert(1, '/tmp/pylib/')
+
+        from ruamel.yaml import YAML
+
+
+        class S3_service():
+            '''
+            S3 service class
+            '''
+            def __init__(self):
+                '''
+                Initialize the S3 service
+                '''
+                self.s3 = boto3.client('s3')
+                self.retry_limit = 3
+                self.retry_delay = 10
+
+            def check_file_exists(self, bucket, key):
+                '''
+                Check if the file exists in the S3 bucket
+                Parameters:
+                    bucket (str): The name of the S3 bucket
+                    key (str): The key of the file in the S3 bucket
+                Returns:
+                    bool: True if the file exists, False otherwise
+                '''
+                # check if the function parameters are valid
+                if not isinstance(bucket, str):
+                    raise ValueError("bucket must be a string")
+                if not isinstance(key, str):
+                    raise ValueError("key must be a string")
+
+                failure = False
+                exception = None
+                file_exists = False
+
+                for i in range(self.retry_limit):
+                    try:
+                        try:
+                            self.s3.head_object(Bucket=bucket, Key=key)
+                            file_exists = True
+                        except ClientError as e:
+                            if e.response['Error']['Code'] != '404':
+                                raise e
+
+                            print(f"File does not exist: {key}")
+                            file_exists = False
+
+                        failure = False
+                        break
+                    except Exception as e:
+                        print(f"Error downloading file from S3: {e}")
+                        print(f"Retry in {self.retry_delay} seconds")
+                        exception = e
+                        failure = True
+                        time.sleep(self.retry_delay)
+
+                if failure:
+                    raise exception
+
+                if file_exists:
+                    return True
+
+            def upload_file(self, file_path, bucket, key):
+                '''
+                Upload a file to the S3 bucket
+                Parameters:
+                    file_path (str): The path to the file to upload
+                    bucket (str): The name of the S3 bucket
+                    key (str): The key of the file in the S3 bucket
+                '''
+                # check if the function parameters are valid
+                if not isinstance(file_path, str):
+                    raise ValueError("file_path must be a string")
+                if not isinstance(bucket, str):
+                    raise ValueError("bucket must be a string")
+                if not isinstance(key, str):
+                    raise ValueError("key must be a string")
+
+                failure = False
+                exception = None
+
+                print(f"Uploading file to S3: {file_path} to {bucket}/{key}")
+
+                for i in range(self.retry_limit):
+                    try:
+                        self.s3.upload_file(file_path, bucket, key)
+                        failure = False
+                        break
+                    except Exception as e:
+                        print(f"Error uploading file to S3: {e}")
+                        print(f"Retry in {self.retry_delay} seconds")
+                        exception = e
+                        failure = True
+                        time.sleep(self.retry_delay)
+
+                if failure:
+                    raise exception
+
+            def download_file(self, bucket, key, file_path):
+                '''
+                Download a file from the S3 bucket
+                Parameters:
+                    bucket (str): The name of the S3 bucket
+                    key (str): The key of the file in the S3 bucket
+                    file_path (str): The path to the file to download
+                '''
+                # check if the function parameters are valid
+                if not isinstance(bucket, str):
+                    raise ValueError("bucket must be a string")
+                if not isinstance(key, str):
+                    raise ValueError("key must be a string")
+                if not isinstance(file_path, str):
+                    raise ValueError("file_path must be a string")
+
+                failure = False
+                exception = None
+
+                print(f"Downloading file from S3: {bucket}/{key} to {file_path}")
+
+                for i in range(self.retry_limit):
+                    try:
+                        self.s3.download_file(bucket, key, file_path)
+                        failure = False
+                        break
+                    except Exception as e:
+                        print(f"Error downloading file from S3: {e}")
+                        print(f"Retry in {self.retry_delay} seconds")
+                        exception = e
+                        failure = True
+                        time.sleep(self.retry_delay)
+
+                if failure:
+                    raise exception
+
+            def delete_file(self, Bucket, Key):
+                '''
+                Delete a file from the S3 bucket
+                Parameters:
+                    Bucket (str): The name of the S3 bucket
+                    Key (str): The key of the file in the S3 bucket
+                '''
+                # check if the function parameters are valid
+                if not isinstance(Bucket, str):
+                    raise ValueError("Bucket must be a string")
+                if not isinstance(Key, str):
+                    raise ValueError("Key must be a string")
+
+                failure = False
+                exception = None
+
+                for i in range(self.retry_limit):
+                    try:
+                        self.s3.delete_object(Bucket=Bucket, Key=Key)
+                        failure = False
+                        break
+                    except Exception as e:
+                        print(f"Error downloading file from S3: {e}")
+                        print(f"Retry in {self.retry_delay} seconds")
+                        exception = e
+                        failure = True
+                        time.sleep(self.retry_delay)
+
+                if failure:
+                    raise exception
+
+            def list_files(self, bucket, prefix):
+                '''
+                List files in the S3 bucket
+                Parameters:
+                    bucket (str): The name of the S3 bucket
+                    prefix (str): The prefix of the files in the S3 bucket
+                '''
+                # check if the function parameters are valid
+                if not isinstance(bucket, str):
+                    raise ValueError("bucket must be a string")
+                if not isinstance(prefix, str):
+                    raise ValueError("prefix must be a string")
+
+                failure = False
+                exception = None
+
+                for i in range(self.retry_limit):
+                    try:
+                        response = self.s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+                        failure = False
+                        break
+                    except Exception as e:
+                        print(f"Error downloading file from S3: {e}")
+                        print(f"Retry in {self.retry_delay} seconds")
+                        exception = e
+                        failure = True
+                        time.sleep(self.retry_delay)
+
+                if failure:
+                    raise exception
+
+                return response
+
+            def clean_objects_with_prefix(self, bucket, prefix):
+                '''
+                Clean up the S3 bucket
+                Parameters:
+                    bucket (str): The name of the S3 bucket
+                    prefix (str): The prefix of the files in the S3 bucket
+                '''
+                # check if the function parameters are valid
+                if not isinstance(bucket, str):
+                    raise ValueError("bucket must be a string")
+                if not isinstance(prefix, str):
+                    raise ValueError("prefix must be a string")
+
+                func = "clean_s3_prefix"
+
+                print(f"{func}: Clean up folder: {prefix}")
+
+                try:
+
+                    response = self.list_files(bucket, prefix)
+
+                    if 'Contents' in response:
+                        for item in response['Contents']:
+                            file_key = item['Key']
+
+                            print(f"{func}: Deleting file: {file_key}")
+
+                            if file_key[-1] == '/':
+                                continue
+
+                            self.delete_file(bucket, file_key)
+                except Exception as e:
+                    print(f"{func}: Failed to clean up scratch folder: {e}")
+                    return
+
+
+        class CloudFormation_service():
+            '''
+            CloudFormation service class
+            '''
+            def __init__(self):
+                '''
+                Initialize the CloudFormation service
+                '''
+                self.cf_client = boto3.client('cloudformation')
+                self.retry_limit = 3
+                self.retry_delay = 10
+
+            def update_stack(self, stack_name, template_url, role_arn):
+                '''
+                Update the stack
+                Args:
+                    template_url (str): The URL of the template to update the stack with
+                '''
+                if not isinstance(template_url, str):
+                    raise ValueError("template_url must be a string")
+
+                parameters = []
+                capabilities = [
+                    'CAPABILITY_IAM',
+                    'CAPABILITY_NAMED_IAM',
+                    'CAPABILITY_AUTO_EXPAND'
+                ]
+
+                # Update the stack
+                try:
+                    response = self.cf_client.update_stack(
+                        StackName=stack_name,
+                        TemplateURL=template_url,
+                        RoleARN=role_arn,
+                        Capabilities=capabilities,
+                        Parameters=parameters,
+                    )
+                    print(f"Stack update initiated successfully. Response: {json.dumps(response, indent=4)}")
+                except ClientError as e:
+                    if "No updates are to be performed" in str(e):
+                        print("No changes detected in the stack.")
+                    else:
+                        print(f"Error updating stack: {e}")
+                        raise e
+
+            def get_stack_status(self, stack_name):
+                '''
+                Get the stack status
+                Args:
+                    stack_name (str): The name of the stack to get the status of
+                Returns:
+                    str: The status of the stack
+                '''
+                try:
+                    response = self.cf_client.describe_stacks(StackName=stack_name)
+                    return response['Stacks'][0]['StackStatus']
+                except Exception as e:
+                    print(f"Error getting stack status: {e}")
+                    raise e
+
+            def get_stack_resources(self, stack_name):
+                '''
+                Get the stack resources
+                '''
+                try:
+                    response = self.cf_client.describe_stack_resources(StackName=stack_name)
+
+                    return response['StackResources']
+                except Exception as e:
+                    print(f"Error getting stack resources: {e}")
+                    raise e
+
+
+        class Ecs_service():
+            '''
+            ECS service class
+            '''
+            def __init__(self):
+                '''
+                Initialize the ECS service
+                '''
+                self.ecs_client = boto3.client('ecs')
+                self.retry_limit = 3
+                self.retry_delay = 10
+
+            def describe_service(self, cluster, services):
+                '''
+                Describe the service
+                '''
+                try:
+                    response = self.ecs_client.describe_services(cluster=cluster, services=services)
+                    return response['services']
+                except Exception as e:
+                    print(f"Error describing service: {e}")
+                    raise e
+
+            def describe_task_definition(self, task_definition):
+                '''
+                Describe the task definition
+                '''
+                try:
+                    response = self.ecs_client.describe_task_definition(taskDefinition=task_definition)
+                    return response
+                except Exception as e:
+                    print(f"Error describing task definition: {e}")
+                    raise e
+
+            def service_list_tasks(self, cluster, service):
+                '''
+                List the tasks for a service
+                '''
+                try:
+                    response = self.ecs_client.list_tasks(cluster=cluster, serviceName=service, desiredStatus="RUNNING")
+                    return response
+                except Exception as e:
+                    print(f"Error listing tasks: {e}")
+                    raise e
+
+            def describe_tasks(self, cluster, task_arns):
+                '''
+                Describe the tasks
+                '''
+                try:
+                    response = self.ecs_client.describe_tasks(cluster=cluster, tasks=task_arns)
+                    return response
+                except Exception as e:
+                    print(f"Error describing tasks: {e}")
+                    raise e
+
+            def update_service(self, cluster, service, task_definition, force_update=True):
+                '''
+                Update the service
+                '''
+                try:
+                    response = self.ecs_client.update_service(
+                        cluster=cluster,
+                        serviceName=service,
+                        taskDefinition=task_definition,
+                        forceNewDeployment=force_update,
+                    )
+                    return response
+                except Exception as e:
+                    print(f"Error updating service: {e}")
+                    raise e
+
+
+        # Replace with your target repository details
+        OWNER = os.getenv("OWNER")
+        REPO = os.getenv("REPO")
+        BRANCH = os.getenv("BRANCH")
+        BUCKET = os.getenv("BUCKET")
+        STACK_NAME = os.getenv("STACK_NAME")
+        TEMPLATE_REPO_FILEPATH = os.getenv("TEMPLATE_REPO_FILEPATH")
+        UI_LB_URL = os.getenv('UI_LB_URL')
+        UI_USERNAME = os.getenv("UI_USERNAME")
+        UI_PASSWORD = os.getenv("UI_PASSWORD")
+        AIRFLOW_BASE_URL = os.getenv('AIRFLOW_BASE_URL')
+        AIRFLOW_USERNAME = os.getenv('AIRFLOW_USERNAME')
+        AIRFLOW_PASSWORD = os.getenv('AIRFLOW_PASSWORD')
+        ROLE_ARN = os.getenv('ROLE_ARN')
+
+        missing_variables = []
+
+        if not OWNER:
+            missing_variables.append("OWNER")
+        if not REPO:
+            missing_variables.append("REPO")
+        if not BRANCH:
+            missing_variables.append("BRANCH")
+        if not BUCKET:
+            missing_variables.append("BUCKET")
+        if not STACK_NAME:
+            missing_variables.append("STACK_NAME")
+        if not TEMPLATE_REPO_FILEPATH:
+            missing_variables.append("TEMPLATE_REPO_FILEPATH")
+        if not UI_LB_URL:
+            missing_variables.append("UI_LB_URL")
+        if not UI_USERNAME:
+            missing_variables.append("UI_USERNAME")
+        if not UI_PASSWORD:
+            missing_variables.append("UI_PASSWORD")
+        if not AIRFLOW_BASE_URL:
+            missing_variables.append("AIRFLOW_BASE_URL")
+        if not ROLE_ARN:
+            missing_variables.append("ROLE_ARN")
+
+        if missing_variables:
+            print(f"Missing variables: {missing_variables}")
+            raise ValueError(f"Missing variables: {missing_variables}")
+
+        S3_SERVICE = S3_service()
+        CLOUDFORMATION_SERVICE = CloudFormation_service()
+        ECS_SERVICE = Ecs_service()
+
+        SCRATCH_DIR = "scratch"
+
+        TEMP_FILE_PREFIX = "/tmp/lambda"
+        os.makedirs(TEMP_FILE_PREFIX, exist_ok=True)
+
+        TEMPLATE_REPO_COMMIT_FILEPATH = "repo/repo_commit.json"
+        TEMP_TEMPLATE_REPO_COMMIT_FILEPATH = f"{TEMP_FILE_PREFIX}/repo_commit.json"
+
+        TEMPLATE_FILEPATH = "repo/template.yaml"
+        TEMP_TEMPLATE_FILEPATH = f"{TEMP_FILE_PREFIX}/template.yaml"
+
+
+        def lambda_handler(event, context):
+
+            latest_commit = get_latest_commit()
+            if latest_commit is None:
+                print("Failed to get the latest commit from the target branch.")
+                return
+
+            print(latest_commit)
+
+            sha = latest_commit["sha"]
+            message = latest_commit["commit"]["message"]
+            author = latest_commit["commit"]["author"]["name"]
+            date = latest_commit["commit"]["author"]["date"]
+
+            file_exists = fetch_file_if_present(BUCKET, TEMPLATE_REPO_COMMIT_FILEPATH, TEMP_TEMPLATE_REPO_COMMIT_FILEPATH)
+
+            is_update_stack = True
+
+            if file_exists:
+                with open(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, 'r') as f:
+                    template_repo_commit_json = json.load(f)
+
+                # if the stack statuc on current sha is success, then no need to update the stack
+                # if the stack status on current sha is failure, then it had failed to update the stack,
+                # keep it in stable state as rolledback. Mark the current commit as failure.
+                # if the stack status on current sha is anything else, then check for the current status of the stack and do the updates accordingly.
+                if template_repo_commit_json["sha"] == sha:
+                    print("No new commits. No need to update the stack.")
+                    if template_repo_commit_json["stack_status"] == "success":
+                        print("Stack is in success state. No need to update the stack.")
+                        return
+                    elif template_repo_commit_json["stack_status"] == "failed":
+                        print("Stack is in failed state. Rolled back to the previous workingstate.")
+                        return
+                    else:
+                        print("Stack status is unknown. Please check the stack status.")
+                        is_update_stack = False
+
+            else:
+                print("No repo commit file found. Creating a new one.")
+                print(f"sha: {sha}")
+
+                # As this is a first check on the repo, we assume that the current commit is the latest used for stack
+                # adding init status as success that the current commit id is in success state with stack.
+
+                template_repo_commit_json = {
+                    "sha": sha,
+                    "message": message,
+                    "author": author,
+                    "date": date,
+                    "stack_status": "success",
+                }
+
+                with open(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, 'w') as f:
+                    json.dump(template_repo_commit_json, f)
+
+                S3_SERVICE.upload_file(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, BUCKET, TEMPLATE_REPO_COMMIT_FILEPATH)
+
+                return
+
+            if is_update_stack:
+                print("New commit found. Update stack.")
+                update_stack(latest_commit)
+            else:
+                print("No new commit found. Check current stack status.")
+                check_stack_update_status()
+
+
+        def update_stack(latest_commit):
+            '''
+            Update the stack
+            Args:
+                latest_commit (dict): The latest commit from the target branch
+            '''
+            func = "update_stack"
+
+            print(f"{func}: Update current stack: {STACK_NAME}")
+
+            url = f"https://raw.githubusercontent.com/{OWNER}/{REPO}/{BRANCH}/{TEMPLATE_REPO_FILEPATH}"
+            headers = {}
+
+            try:
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+
+                file_content = response.text
+
+                with open(TEMP_TEMPLATE_FILEPATH, "w", encoding="utf-8") as file:
+                    file.write(file_content)
+                print(f"Template file saved at: {TEMP_TEMPLATE_FILEPATH}")
+
+            except Exception as e:
+                print(f"{func}: Failed to get the template from the repo: {e}")
+                raise e
+
+            # update the template file on s3
+            S3_SERVICE.upload_file(TEMP_TEMPLATE_FILEPATH, BUCKET, TEMPLATE_FILEPATH)
+
+            template_url = f"https://{BUCKET}.s3.amazonaws.com/{TEMPLATE_FILEPATH}"
+
+            print(f"Template URL: {template_url}")
+
+            # pause the pipeline
+            print(f"{func}: Pause the pipeline on Airflow")
+            payload = {
+                "is_paused": True
+            }
+            api_airflow_patch_dag(AIRFLOW_BASE_URL, AIRFLOW_USERNAME, AIRFLOW_PASSWORD, "file_polling", payload)
+
+            # check statuses of dags on Airflow
+            print(f"{func}: Check statuses of dags on Airflow")
+            can_update_stack = check_pipelines_completion_status(AIRFLOW_BASE_URL, AIRFLOW_USERNAME, AIRFLOW_PASSWORD)
+
+            if can_update_stack:
+                print(f"{func}: Update stack")
+                CLOUDFORMATION_SERVICE.update_stack(STACK_NAME, template_url, ROLE_ARN)
+            else:
+                print(f"{func}: Cannot update stack yet")
+
+            print("Update the repo commit file")
+            template_repo_commit_json = {
+                "sha": latest_commit["sha"],
+                "message": latest_commit["commit"]["message"],
+                "author": latest_commit["commit"]["author"]["name"],
+                "date": latest_commit["commit"]["author"]["date"],
+                "stack_status": "update_in_progress",
+            }
+
+            with open(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, 'w') as f:
+                json.dump(template_repo_commit_json, f)
+
+            S3_SERVICE.upload_file(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, BUCKET, TEMPLATE_REPO_COMMIT_FILEPATH)
+
+
+        def check_stack_update_status():
+            '''
+            Check the stack update status
+            '''
+            stack_operation_status = check_stack_operation(STACK_NAME, "update")
+
+            template_repo_commit_json = json.load(open(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, 'r'))
+
+            if stack_operation_status is None:
+                print("Stack update is still in progress")
+                return
+
+            if stack_operation_status:
+                print("Stack update completed successfully")
+                template_repo_commit_json["stack_status"] = "success"
+                check_current_task_running()
+            else:
+                print("Stack update failed")
+                template_repo_commit_json["stack_status"] = "failed"
+
+            print("Resume the pipeline on Airflow")
+            payload = {
+                "is_paused": False
+            }
+            api_airflow_patch_dag(AIRFLOW_BASE_URL, AIRFLOW_USERNAME, AIRFLOW_PASSWORD, "file_polling", payload)
+
+            with open(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, 'w') as f:
+                json.dump(template_repo_commit_json, f)
+
+            S3_SERVICE.upload_file(TEMP_TEMPLATE_REPO_COMMIT_FILEPATH, BUCKET, TEMPLATE_REPO_COMMIT_FILEPATH)
+
+
+        def check_stack_operation(stack_name, operation):
+            """
+            Checks cloud formation stack to exit with either complete for failed state for a given operation
+
+            Args:
+                stack_name: Name of cloud formation stack
+                operation: Type of stack operation (create/update)
+
+            Returns: None - if the stack is still in progress
+                    True - if the stack is in success state
+                    False - if the stack is in failed state
+
+            """
+            print(f"Waiting for stack {operation} to complete...")
+
+            status = CLOUDFORMATION_SERVICE.get_stack_status(stack_name)
+
+            if status.endswith('_ROLLBACK_COMPLETE'):
+                print(f"Stack {operation} failed with status: {status}")
+                return False
+            if status.endswith('_COMPLETE'):
+                print(f"Stack {operation} completed with status: {status}")
+                return status == f'{operation.upper()}_COMPLETE'
+
+            print(f"Current stack status: {status}")
+            return None
+
+
+        def check_pipelines_completion_status(airflow_url, username, password):
+            """
+            Check the status of all pipelines
+
+            Args:
+                airflow_url (str): The DNS name of the Airflow instance
+                username (str): The username for the Airflow instance
+                password (str): The password for the Airflow instance
+
+            Returns:
+                bool: True if all dag runs are either in failed or success state, False otherwise
+            """
+            dags_to_monitor = [
+                'aggregator',
+                'clustering',
+                'file_polling',
+                'schema_matcher_and_classifier',
+                'sequencer',
+                'save_feedback',
+            ]
+
+            dag_runs = {}  # Track runs for each DAG
+
+            print("Checking DAG statuses...")
+
+            # Check for new runs and update existing ones
+            for dag_id in dags_to_monitor:
+                active_runs = api_airflow_check_dag_status(airflow_url, username, password, dag_id)
+
+                if active_runs:
+                    if dag_id not in dag_runs:
+                        dag_runs[dag_id] = {}
+
+                    for run_status in active_runs:
+                        run_id = run_status['run_id']
+
+                        # If this is a new run we haven't seen before
+                        if run_id not in dag_runs[dag_id]:
+                            dag_runs[dag_id][run_id] = run_status
+                            print(f"New run detected for {dag_id} - Run ID: {run_id}")
+
+                        # Update the status for this run
+                        dag_runs[dag_id][run_id] = run_status
+
+                        # log current status
+                        print(f"{dag_id} (Run: {run_id}): {run_status['status']}")
+
+            # Check if all runs are complete
+            all_complete = True
+            active_runs_exist = False
+            has_failures = False
+
+            for dag_id in dags_to_monitor:
+                if dag_id in dag_runs:
+                    for run_id, run_status in dag_runs[dag_id].items():
+                        active_runs_exist = True
+                        current_status = api_airflow_dag_run_status(airflow_url, username, password, dag_id, run_id)
+
+                        if current_status:
+                            dag_runs[dag_id][run_id] = current_status
+
+                            # if the dag id is file_polling, then paused dag may have queued statuses which is valid status for all completed
+                            if dag_id == "file_polling" and current_status['status'] not in ['success', 'failed', 'queued']:
+                                all_complete = False
+
+                            elif current_status['status'] not in ['success', 'failed']:
+                                all_complete = False
+
+                            if current_status['status'] == 'failed':
+                                has_failures = True
+
+            # log summary of all runs
+            print("\nCurrent DAG Run Summary:")
+            for dag_id in dags_to_monitor:
+                if dag_id in dag_runs:
+                    for run_id, run_status in dag_runs[dag_id].items():
+                        print(f"{dag_id} - Run {run_id}: {run_status['status']}")
+
+            # If we have active runs and they're all complete, we're done
+            if active_runs_exist and all_complete:
+                if has_failures:
+                    print("\nAll DAG runs completed, but some failed!")
+                else:
+                    print("\nAll DAG runs completed successfully!")
+                return True
+
+            elif not active_runs_exist:
+                print("\nNo active runs found. Exiting...")
+                return True
+
+            return False
+
+
+        def check_current_task_running():
+            '''
+            Check that current task are running with new image
+            '''
+            # check current template file on s3
+            S3_SERVICE.download_file(BUCKET, TEMPLATE_FILEPATH, TEMP_TEMPLATE_FILEPATH)
+
+            # Initialize ruamel.yaml YAML handler
+            yaml = YAML()
+
+            # Read the YAML file
+            with open(TEMP_TEMPLATE_FILEPATH, 'r') as f:
+                yaml_data = yaml.load(f)
+
+            new_images_yaml = yaml_data["Mappings"]["Images"]
+
+            new_images_keys = {
+                "airflow": new_images_yaml["AirflowContainerImage"]["ImageUri"],
+                "ui": new_images_yaml["WebContainerImage"]["ImageUri"],
+            }
+
+            print("Get tasks currently running on the stack")
+
+            service_task_arns = get_service_task_arns()
+
+            task_updated, task_to_update = check_task_image_update(service_task_arns, new_images_keys)
+
+            if task_updated:
+                print("Tasks are updated")
+            else:
+                print("Tasks are not updated. Force update the tasks")
+                force_update_tasks(service_task_arns, task_to_update)
+
+
+        def get_service_task_arns():
+            '''
+            Get the service, task arns from the stack
+            Returns:
+                dict: A dictionary containing the service and task arns
+            '''
+
+            service_task_arns = {
+                "ui": {},
+                "airflow": {},
+            }
+
+            try:
+                # Describe stack resources
+                resources = CLOUDFORMATION_SERVICE.get_stack_resources(STACK_NAME)
+
+                # Loop through resources to find ECS Cluster
+                for resource in resources:
+
+                    if resource["LogicalResourceId"] == "UIEcsService":
+                        service_task_arns["ui"]["service"] = resource["PhysicalResourceId"]
+
+                    elif resource["LogicalResourceId"] == "AirflowEcsService":
+                        service_task_arns["airflow"]["service"] = resource["PhysicalResourceId"]
+
+                    elif resource["LogicalResourceId"] == "UITaskDefinition":
+                        service_task_arns["ui"]["task_definition"] = resource["PhysicalResourceId"]
+
+                    elif resource["LogicalResourceId"] == "AirflowTaskDefinition":
+                        service_task_arns["airflow"]["task_definition"] = resource["PhysicalResourceId"]
+
+                    elif resource["LogicalResourceId"] == "ECSCluster":
+                        service_task_arns["cluster"] = resource["PhysicalResourceId"]
+
+                return service_task_arns
+
+            except Exception as e:
+                raise e
+
+
+        def check_task_image_update(service_task_arns, new_images_keys):
+            '''
+            Check if the task image is updated
+            '''
+
+            # check for UI service
+            print("Check if UI service is updated")
+
+            ui_service = ECS_SERVICE.describe_service(service_task_arns["cluster"], [service_task_arns["ui"]["service"]])
+            service_task_def = ui_service[0]["taskDefinition"]
+
+            if service_task_def == service_task_arns["ui"]["task_definition"]:
+                print("UI service is updated")
+            else:
+                print("UI service is not updated")
+                return False, "ui"
+
+            print("Check UI task definition images")
+            ui_task_definition = ECS_SERVICE.describe_task_definition(service_task_arns["ui"]["task_definition"])
+
+            for container in ui_task_definition["taskDefinition"]["containerDefinitions"]:
+                if container["name"] == "bastet_web":
+                    if container["image"] == new_images_keys["ui"]:
+                        print("UI task definition image is updated")
+                    else:
+                        print("UI task definition image is not updated")
+                        return False, "ui"
+
+            print("List service tasks")
+            service_list_tasks = ECS_SERVICE.service_list_tasks(service_task_arns["cluster"], service_task_arns["ui"]["service"])
+
+            if len(service_list_tasks["taskArns"]) <= 0:
+                print("No tasks are running for the UI service")
+                return False, "ui"
+
+            tasks_response = ECS_SERVICE.describe_tasks(service_task_arns["cluster"], service_list_tasks["taskArns"])
+
+            ui_task_updated = False
+            for task in tasks_response["tasks"]:
+                if task["taskDefinitionArn"] == service_task_arns["ui"]["task_definition"]:
+                    print("UI task is updated")
+                    ui_task_updated = True
+                    break
+
+            if not ui_task_updated:
+                print("UI task is not updated")
+                return False, "ui"
+
+            # check for Airflow service
+            print("Check if the Airflow service is updated")
+
+            airflow_service = ECS_SERVICE.describe_service(service_task_arns["cluster"], [service_task_arns["airflow"]["service"]])
+            service_task_def = airflow_service[0]["taskDefinition"]
+
+            if service_task_def == service_task_arns["airflow"]["task_definition"]:
+                print("Airflow service is updated")
+            else:
+                print("Airflow service is not updated")
+                return False, "airflow"
+
+            print("Check Airflow task definition images")
+            airflow_task_definition = ECS_SERVICE.describe_task_definition(service_task_arns["airflow"]["task_definition"])
+
+            for container in airflow_task_definition["taskDefinition"]["containerDefinitions"]:
+                if container["name"] == "airflow-webserver":
+                    if container["image"] == new_images_keys["airflow"]:
+                        print("Airflow task definition image is updated")
+                    else:
+                        print("Airflow task definition image is not updated")
+                        return False, "airflow"
+
+            print("List service tasks")
+            service_list_tasks = ECS_SERVICE.service_list_tasks(service_task_arns["cluster"], service_task_arns["airflow"]["service"])
+
+            if len(service_list_tasks["taskArns"]) <= 0:
+                print("No tasks are running for the Airflow service")
+                return False, "airflow"
+
+            tasks_response = ECS_SERVICE.describe_tasks(service_task_arns["cluster"], service_list_tasks["taskArns"])
+
+            airflow_task_updated = False
+            for task in tasks_response["tasks"]:
+                if task["taskDefinitionArn"] == service_task_arns["airflow"]["task_definition"]:
+                    print("Airflow task is updated")
+                    airflow_task_updated = True
+                    break
+
+            if not airflow_task_updated:
+                print("Airflow task is not updated")
+                return False, "airflow"
+
+            return True, None
+
+
+        def force_update_tasks(service_task_arns, task_to_update):
+            '''
+            Force update the tasks
+            '''
+            print(f"Force update the {task_to_update} task")
+
+            if task_to_update == "ui":
+                ECS_SERVICE.update_service(service_task_arns["cluster"],
+                                           service_task_arns["ui"]["service"],
+                                           service_task_arns["ui"]["task_definition"])
+
+            elif task_to_update == "airflow":
+                ECS_SERVICE.update_service(service_task_arns["cluster"],
+                                           service_task_arns["airflow"]["service"],
+                                           service_task_arns["airflow"]["task_definition"])
+
+
+        def get_latest_commit():
+            '''
+            Get the latest commit from the target branch
+            Returns:
+                commit: dict
+            '''
+            url = f"https://api.github.com/repos/{OWNER}/{REPO}/commits?sha={BRANCH}"
+            headers = {}
+
+            try:
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+
+                commits = response.json()
+                commit = commits[0]
+
+                return commit
+            except Exception as e:
+                print(f"Error fetching commits: {e}")
+
+            return None
+
+
+        def fetch_file_if_present(bucket, volume_file_key, temp_file_path):
+            '''
+            Check if the file exists on S3. Download if its present
+            Args:
+                bucket (string): bucket name
+                volume_file_key (string): File key path to the cluster ticket output in volume
+                temp_file_path (string): local file path to download the cluster ticket output to
+
+            Returns:
+                bool: Boolean value false, if there is no such file, true if there is a file
+            '''
+
+            if not isinstance(bucket, str):
+                raise ValueError("bucket must be a string")
+            if not isinstance(volume_file_key, str):
+                raise ValueError("volume_file_key must be a string")
+            if not isinstance(temp_file_path, str):
+                raise ValueError("temp_file_path must be a string")
+
+            func = "fetch_file_if_present"
+
+            print(
+                f"{func}: Checking if file exists on S3 path {bucket}/{volume_file_key}")
+
+            file_exists = S3_SERVICE.check_file_exists(bucket, volume_file_key)
+
+            if not file_exists:
+                print(f"{func}: File does not exist on S3. Return False")
+                return False
+
+            else:
+                print(f"{func}: File exists on S3. Downloading file")
+                S3_SERVICE.download_file(bucket, volume_file_key, temp_file_path)
+                print(f"{func}: File downloaded")
+                return True
+
+
+        def api_airflow_patch_dag(airflow_url, username, password, dag_id, payload):
+            '''
+            Pause the dag
+            Args:
+                airflow_url (string): Airflow URL
+                username (string): Airflow username
+                password (string): Airflow password
+            '''
+            func = "api_airflow_pause_dag"
+
+            headers = {"Content-Type": "application/json"}
+
+            try:
+                url = f"{airflow_url}/api/v1/dags/{dag_id}"
+                response = requests.patch(
+                    url,
+                    auth=HTTPBasicAuth(username, password),
+                    headers=headers,
+                    json=payload
+                )
+                response.raise_for_status()
+                print(f"{func}: Pipeline patched")
+            except Exception as e:
+                print(f"{func}: Failed to patch the pipeline: {e}")
+                raise e
+
+
+        def api_airflow_check_dag_status(airflow_url, username, password, dag_id):
+            """
+            Check the status of a DAG in Airflow
+
+            Args:
+                airflow_url (str): The URL of the Airflow instance
+                username (str): The username for the Airflow instance
+                password (str): The password for the Airflow instance
+                dag_id (str): The ID of the DAG to check
+
+            Returns:
+                list: A list of dictionaries containing the status of each DAG run
+            """
+            base_url = f"{airflow_url}/api/v1"
+
+            headers = {"Content-Type": "application/json"}
+
+            try:
+                response = requests.get(
+                    f"{base_url}/dags/{dag_id}/dagRuns",
+                    auth=HTTPBasicAuth(username, password),
+                    headers=headers,
+                )
+
+                response.raise_for_status()
+
+                dag_runs = response.json()['dag_runs']
+                # Return all runs, not just active ones
+                runs = []
+                for run in dag_runs:
+                    runs.append({
+                        'dag_id': dag_id,
+                        'status': run['state'],
+                        'start_date': run['start_date'],
+                        'end_date': run['end_date'],
+                        'run_id': run['dag_run_id']
+                    })
+                return runs
+            except Exception as e:
+                print(f"Error connecting to Airflow API for DAG {dag_id}: {e}")
+                raise e
+
+
+        def api_airflow_dag_run_status(airflow_url, username, password, dag_id, run_id):
+            """
+            Check the current status of a specific DAG run
+
+            Args:
+                airflow_url (str): The DNS name of the Airflow instance
+                username (str): The username for the Airflow instance
+                password (str): The password for the Airflow instance
+                dag_id (str): The ID of the DAG to check
+                run_id (str): The ID of the DAG run to check
+
+            Returns:
+                dict: A dictionary containing the status of the DAG run
+            """
+            base_url = f"{airflow_url}/api/v1"
+
+            headers = {'Content-Type': 'application/json'}
+
+            try:
+                response = requests.get(
+                    f"{base_url}/dags/{dag_id}/dagRuns/{run_id}",
+                    auth=HTTPBasicAuth(username, password),
+                    headers=headers,
+                )
+
+                response.raise_for_status()
+
+                run = response.json()
+                return {
+                    'dag_id': dag_id,
+                    'status': run['state'],
+                    'start_date': run['start_date'],
+                    'end_date': run['end_date'],
+                    'run_id': run['dag_run_id']
+                }
+            except Exception as e:
+                print(f"Error checking status for DAG {dag_id} run {run_id}: {e}")
+                raise e
+
+      Handler: index.lambda_handler
+      Runtime: python3.11
+      MemorySize: 3008
+      EphemeralStorage:
+        Size: 10240
+      ReservedConcurrentExecutions: 1
+      Timeout: 900
+      Role: !GetAtt LambdaRole.Arn
+      Tracing: Active
+      Layers:
+      - !FindInMap
+        - RegionMap
+        - !Ref AWS::Region
+        - lambdaLayer
+      Environment:
+        Variables:
+          OWNER: Nidheesh-Panchal
+          REPO: temp
+          BRANCH: v0.10.1
+          BUCKET: !Ref Bucket
+          STACK_NAME: !Ref AWS::StackName
+          TEMPLATE_REPO_FILEPATH: template-v0.10.1-local.yaml
+          UI_LB_URL: !Sub "http://${UILoadBalancer.DNSName}:8000"
+          UI_USERNAME: !FindInMap [UI, ServiceWorkerPassword, Value]
+          UI_PASSWORD: !FindInMap [UI, ServiceWorkerUsername, Value]
+          AIRFLOW_BASE_URL: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
+          AIRFLOW_USERNAME: !Ref AirflowUsername
+          AIRFLOW_PASSWORD: !Ref AirflowPassword
+          ROLE_ARN: !Ref CloudFormationRoleArn
+      Events:
+        Schedule1:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+
+  autoUpdateStackLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${autoUpdateStack}
+
+  autoUpdateStackLambdaEventInvokeConfig:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName: !Ref autoUpdateStack
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
 
   EcsModelExecutionRole:
     Type: AWS::IAM::Role
@@ -912,8 +2141,8 @@ Resources:
           Protocol: tcp
         Essential: false
         Command:
-        - '--config'
-        - '/code/otel_config/otel-collector-config.yaml'
+        - --config
+        - /code/otel_config/otel-collector-config.yaml
         Environment:
         - Name: STACK_NAME
           Value: !Sub ${AWS::StackName}
@@ -929,16 +2158,6 @@ Resources:
             awslogs-group: !Sub /ecs/${AWS::StackName}-cluster
             awslogs-region: !Ref AWS::Region
             awslogs-stream-prefix: ecs
-        HealthCheck:
-          Command:
-          - CMD
-          - curl
-          - --fail
-          - http://localhost:13133/health
-          Interval: 30
-          Timeout: 10
-          Retries: 5
-          StartPeriod: 30
         SystemControls: []
         VolumesFrom: []
       Volumes:
@@ -1799,14 +3018,6 @@ Resources:
           DriverOpts:
             size: '10'
             volumetype: gp2
-      - Name: !Sub "${AWS::StackName}_dags_volume"
-        DockerVolumeConfiguration:
-          Scope: shared
-          Driver: rexray/ebs
-          Autoprovision: true
-          DriverOpts:
-            size: '10'
-            volumetype: gp2
       - Name: !Sub "${AWS::StackName}_logs_volume"
         DockerVolumeConfiguration:
           Scope: shared
@@ -1815,22 +3026,19 @@ Resources:
           DriverOpts:
             size: '30'
             volumetype: gp2
-      - Name: !Sub "${AWS::StackName}_config_volume"
+            mode: "0644"
+      - Name: dags_volume
         DockerVolumeConfiguration:
-          Scope: shared
-          Driver: rexray/ebs
-          Autoprovision: true
-          DriverOpts:
-            size: '10'
-            volumetype: gp2
-      - Name: !Sub "${AWS::StackName}_plugins_volume"
+          Scope: task
+          Driver: local
+      - Name: config_volume
         DockerVolumeConfiguration:
-          Scope: shared
-          Driver: rexray/ebs
-          Autoprovision: true
-          DriverOpts:
-            size: '10'
-            volumetype: gp2
+          Scope: task
+          Driver: local
+      - Name: plugins_volume
+        DockerVolumeConfiguration:
+          Scope: task
+          Driver: local
       ContainerDefinitions:
       - Name: postgres
         Image: postgres:13
@@ -1913,35 +3121,27 @@ Resources:
           Protocol: tcp
         Essential: false
         Command:
-        - '--config'
-        - '/opt/airflow/config/otel-collector-config.yaml'
+        - --config
+        - /opt/airflow/config/otel-collector-config.yaml
         Environment:
         - Name: STACK_NAME
           Value: !Sub ${AWS::StackName}
         MountPoints:
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /var/log/app
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
         DependsOn:
         - ContainerName: airflow-init
           Condition: SUCCESS
+        - ContainerName: airflow-webserver
+          Condition: START
         LogConfiguration:
           LogDriver: awslogs
           Options:
             awslogs-group: !Sub /ecs/${AWS::StackName}-cluster
             awslogs-region: !Ref AWS::Region
             awslogs-stream-prefix: ecs
-        HealthCheck:
-          Command:
-          - CMD
-          - curl
-          - --fail
-          - http://localhost:13133/health
-          Interval: 30
-          Timeout: 10
-          Retries: 5
-          StartPeriod: 30
         SystemControls: []
         VolumesFrom: []
       - Name: airflow-webserver
@@ -1981,21 +3181,7 @@ Resources:
         - Name: _PIP_ADDITIONAL_REQUIREMENTS
           Value: ''
         - Name: AIRFLOW__LOGGING__LOGGING_CONFIG_CLASS
-          Value: 'airflow_local_settings.LOGGING_CONFIG'
-        - Name: AIRFLOW__TRACES__OTEL_ON
-          Value: 'True'
-        - Name: AIRFLOW__TRACES__OTEL_HOST
-          Value: 'localhost'
-        - Name: AIRFLOW__TRACES__OTEL_PORT
-          Value: '4318'
-        - Name: AIRFLOW__TRACES__OTEL_SERVICE
-          Value: 'Airflow'
-        - Name: AIRFLOW__TRACES__OTEL_DEBUGGING_ON
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_SSL_ACTIVE
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_TASK_LOG_EVENT
-          Value: 'False'
+          Value: airflow_local_settings.LOGGING_CONFIG
         - Name: VARIABLE_JSON_FILE
           Value: /opt/airflow/logs/run_vars.json
         - Name: AWS_DEFAULT_REGION
@@ -2041,13 +3227,13 @@ Resources:
         - Name: AIRFLOW_BASE_URL
           Value: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
         MountPoints:
-        - SourceVolume: !Sub "${AWS::StackName}_dags_volume"
+        - SourceVolume: dags_volume
           ContainerPath: /opt/airflow/dags
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /opt/airflow/logs
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
-        - SourceVolume: !Sub "${AWS::StackName}_plugins_volume"
+        - SourceVolume: plugins_volume
           ContainerPath: /opt/airflow/plugins
         VolumesFrom: []
         DependsOn:
@@ -2057,10 +3243,6 @@ Resources:
           Condition: HEALTHY
         - ContainerName: airflow-init
           Condition: SUCCESS
-        - ContainerName: airflow-triggerer
-          Condition: START
-        - ContainerName: airflow-worker
-          Condition: START
         - ContainerName: airflow-scheduler
           Condition: START
         LogConfiguration:
@@ -2113,21 +3295,7 @@ Resources:
         - Name: _PIP_ADDITIONAL_REQUIREMENTS
           Value: ''
         - Name: AIRFLOW__LOGGING__LOGGING_CONFIG_CLASS
-          Value: 'airflow_local_settings.LOGGING_CONFIG'
-        - Name: AIRFLOW__TRACES__OTEL_ON
-          Value: 'True'
-        - Name: AIRFLOW__TRACES__OTEL_HOST
-          Value: 'localhost'
-        - Name: AIRFLOW__TRACES__OTEL_PORT
-          Value: '4318'
-        - Name: AIRFLOW__TRACES__OTEL_SERVICE
-          Value: 'Airflow'
-        - Name: AIRFLOW__TRACES__OTEL_DEBUGGING_ON
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_SSL_ACTIVE
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_TASK_LOG_EVENT
-          Value: 'False'
+          Value: airflow_local_settings.LOGGING_CONFIG
         - Name: VARIABLE_JSON_FILE
           Value: /opt/airflow/logs/run_vars.json
         - Name: AWS_DEFAULT_REGION
@@ -2173,13 +3341,13 @@ Resources:
         - Name: AIRFLOW_BASE_URL
           Value: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
         MountPoints:
-        - SourceVolume: !Sub "${AWS::StackName}_dags_volume"
+        - SourceVolume: dags_volume
           ContainerPath: /opt/airflow/dags
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /opt/airflow/logs
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
-        - SourceVolume: !Sub "${AWS::StackName}_plugins_volume"
+        - SourceVolume: plugins_volume
           ContainerPath: /opt/airflow/plugins
         VolumesFrom: []
         DependsOn:
@@ -2189,8 +3357,6 @@ Resources:
           Condition: HEALTHY
         - ContainerName: airflow-init
           Condition: SUCCESS
-        - ContainerName: airflow-triggerer
-          Condition: START
         - ContainerName: airflow-worker
           Condition: START
         LogConfiguration:
@@ -2246,21 +3412,7 @@ Resources:
         - Name: _PIP_ADDITIONAL_REQUIREMENTS
           Value: ''
         - Name: AIRFLOW__LOGGING__LOGGING_CONFIG_CLASS
-          Value: 'airflow_local_settings.LOGGING_CONFIG'
-        - Name: AIRFLOW__TRACES__OTEL_ON
-          Value: 'True'
-        - Name: AIRFLOW__TRACES__OTEL_HOST
-          Value: 'localhost'
-        - Name: AIRFLOW__TRACES__OTEL_PORT
-          Value: '4318'
-        - Name: AIRFLOW__TRACES__OTEL_SERVICE
-          Value: 'Airflow'
-        - Name: AIRFLOW__TRACES__OTEL_DEBUGGING_ON
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_SSL_ACTIVE
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_TASK_LOG_EVENT
-          Value: 'False'
+          Value: airflow_local_settings.LOGGING_CONFIG
         - Name: VARIABLE_JSON_FILE
           Value: /opt/airflow/logs/run_vars.json
         - Name: AWS_DEFAULT_REGION
@@ -2306,13 +3458,13 @@ Resources:
         - Name: AIRFLOW_BASE_URL
           Value: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
         MountPoints:
-        - SourceVolume: !Sub "${AWS::StackName}_dags_volume"
+        - SourceVolume: dags_volume
           ContainerPath: /opt/airflow/dags
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /opt/airflow/logs
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
-        - SourceVolume: !Sub "${AWS::StackName}_plugins_volume"
+        - SourceVolume: plugins_volume
           ContainerPath: /opt/airflow/plugins
         VolumesFrom: []
         DependsOn:
@@ -2364,21 +3516,7 @@ Resources:
         - Name: _PIP_ADDITIONAL_REQUIREMENTS
           Value: ''
         - Name: AIRFLOW__LOGGING__LOGGING_CONFIG_CLASS
-          Value: 'airflow_local_settings.LOGGING_CONFIG'
-        - Name: AIRFLOW__TRACES__OTEL_ON
-          Value: 'True'
-        - Name: AIRFLOW__TRACES__OTEL_HOST
-          Value: 'localhost'
-        - Name: AIRFLOW__TRACES__OTEL_PORT
-          Value: '4318'
-        - Name: AIRFLOW__TRACES__OTEL_SERVICE
-          Value: 'Airflow'
-        - Name: AIRFLOW__TRACES__OTEL_DEBUGGING_ON
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_SSL_ACTIVE
-          Value: 'False'
-        - Name: AIRFLOW__TRACES__OTEL_TASK_LOG_EVENT
-          Value: 'False'
+          Value: airflow_local_settings.LOGGING_CONFIG
         - Name: VARIABLE_JSON_FILE
           Value: /opt/airflow/logs/run_vars.json
         - Name: AWS_DEFAULT_REGION
@@ -2424,13 +3562,13 @@ Resources:
         - Name: AIRFLOW_BASE_URL
           Value: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
         MountPoints:
-        - SourceVolume: !Sub "${AWS::StackName}_dags_volume"
+        - SourceVolume: dags_volume
           ContainerPath: /opt/airflow/dags
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /opt/airflow/logs
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
-        - SourceVolume: !Sub "${AWS::StackName}_plugins_volume"
+        - SourceVolume: plugins_volume
           ContainerPath: /opt/airflow/plugins
         VolumesFrom: []
         DependsOn:
@@ -2440,8 +3578,6 @@ Resources:
           Condition: HEALTHY
         - ContainerName: airflow-init
           Condition: SUCCESS
-        - ContainerName: airflow-opentelemetry
-          Condition: START
         LogConfiguration:
           LogDriver: awslogs
           Options:
@@ -2462,10 +3598,11 @@ Resources:
         Cpu: 0
         PortMappings: []
         Essential: false
+        EntryPoint:
+        - /bin/bash
         Command:
-        - bash
         - -c
-        - echo completed
+        - "mkdir -p /opt/airflow/{logs,dags,plugins} && chown -R \"${AIRFLOW_UID}:0\" /opt/airflow/{logs,dags,plugins} && exec /entrypoint airflow version"
         Environment:
         - Name: AIRFLOW__CORE__SQL_ALCHEMY_CONN
           Value: postgresql+psycopg2://airflow:airflow@localhost/airflow
@@ -2500,13 +3637,13 @@ Resources:
         - Name: AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION
           Value: 'false'
         MountPoints:
-        - SourceVolume: !Sub "${AWS::StackName}_dags_volume"
+        - SourceVolume: dags_volume
           ContainerPath: /sources/dags
         - SourceVolume: !Sub "${AWS::StackName}_logs_volume"
           ContainerPath: /sources/logs
-        - SourceVolume: !Sub "${AWS::StackName}_config_volume"
+        - SourceVolume: config_volume
           ContainerPath: /opt/airflow/config
-        - SourceVolume: !Sub "${AWS::StackName}_plugins_volume"
+        - SourceVolume: plugins_volume
           ContainerPath: /sources/plugins
         VolumesFrom: []
         DependsOn:
