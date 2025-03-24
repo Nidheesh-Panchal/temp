@@ -108,6 +108,7 @@ Parameters:
     Type: String
     Description: Cloud formation Role ARN that will be used to create the current stack
     AllowedPattern: ^arn:aws:iam::[0-9]*:role\/[a-zA-Z0-9:\/_-]+$
+    MinLength: 13
     ConstraintDescription: The value must be a valid ARN
 
   DisableTech:
@@ -427,7 +428,7 @@ Mappings:
         582441423537.dkr.ecr.us-east-1.amazonaws.com/lambda-function-agg:v0.10.1
     AirflowContainerImage:
       ImageUri: >-
-        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.2
+        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.1
     ClusterModelPart1ContainerImage:
       ImageUri: >-
         582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-embedding-ecs:v0.10.1
@@ -561,40 +562,6 @@ Resources:
             - /
             - !Ref AWS::StackId
 
-  # CloudFormationRole:
-  #   Type: AWS::IAM::Role
-  #   Properties:
-  #     AssumeRolePolicyDocument:
-  #       Version: '2012-10-17'
-  #       Statement:
-  #       - Effect: Allow
-  #         Principal:
-  #           Service: lambda.amazonaws.com
-  #         Action: sts:AssumeRole
-  #     Policies:
-  #     - PolicyName: !Sub "${AWS::StackName}-AllowECS"
-  #       PolicyDocument:
-  #         Version: '2012-10-17'
-  #         Statement:
-  #         - Effect: Allow
-  #           Action:
-  #           - ecs:*
-  #           - ec2:*
-  #           - ecs:*
-  #           - elasticloadbalancing:*
-  #           - lambda:*
-  #           - cloudwatch:*
-  #           - cloudformation:*
-  #           - autoscaling:*
-  #           - logs:*
-  #           - route53:*
-  #           - s3:*
-  #           - servicediscovery:*
-  #           - ssm:GetParameters
-  #           - events:*
-  #           - iam:*
-  #           Resource: '*'
-
   LambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -613,6 +580,7 @@ Resources:
           - Effect: Allow
             Action:
             - ecs:*
+            - cloudformation:*
             Resource: '*'
       - PolicyName: !Sub "${AWS::StackName}-IAM-passrole"
         PolicyDocument:
@@ -906,7 +874,12 @@ Resources:
                 if not isinstance(template_url, str):
                     raise ValueError("template_url must be a string")
 
-                parameters = []
+                parameters = [
+                    {
+                        'ParameterKey': 'CloudFormationRoleArn',
+                        'ParameterValue': role_arn
+                    }
+                ]
                 capabilities = [
                     'CAPABILITY_IAM',
                     'CAPABILITY_NAMED_IAM',
