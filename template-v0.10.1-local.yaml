@@ -428,7 +428,7 @@ Mappings:
         582441423537.dkr.ecr.us-east-1.amazonaws.com/lambda-function-agg:v0.10.1
     AirflowContainerImage:
       ImageUri: >-
-        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.1
+        582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-airflow:v0.10.2
     ClusterModelPart1ContainerImage:
       ImageUri: >-
         582441423537.dkr.ecr.us-east-1.amazonaws.com/seshat-embedding-ecs:v0.10.1
@@ -1738,7 +1738,7 @@ Resources:
         Schedule1:
           Type: Schedule
           Properties:
-            Schedule: rate(1 minute)
+            Schedule: rate(10 minute)
 
   autoUpdateStackLogGroup:
     Type: AWS::Logs::LogGroup
@@ -2345,7 +2345,9 @@ Resources:
 
   UIEC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition
+    DependsOn:
+    - UIECSAutoScalingGroup
+    - MyWaitCondition
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref UIECSAutoScalingGroup
@@ -2593,7 +2595,9 @@ Resources:
 
   DbEC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition
+    DependsOn:
+    - DbECSAutoScalingGroup
+    - MyWaitCondition
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref DbECSAutoScalingGroup
@@ -2688,7 +2692,9 @@ Resources:
 
   ClusterPart1EC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition1
+    DependsOn:
+    - ClusterPart1ECSAutoScalingGroup
+    - MyWaitCondition1
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref ClusterPart1ECSAutoScalingGroup
@@ -2782,7 +2788,9 @@ Resources:
 
   FlowEC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition1
+    DependsOn:
+    - FlowECSAutoScalingGroup
+    - MyWaitCondition1
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref FlowECSAutoScalingGroup
@@ -2945,7 +2953,9 @@ Resources:
 
   LambdaEC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition2
+    DependsOn:
+    - LambdaECSAutoScalingGroup
+    - MyWaitCondition2
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref LambdaECSAutoScalingGroup
@@ -3821,7 +3831,9 @@ Resources:
 
   AirflowEC2CapacityProvider:
     Type: AWS::ECS::CapacityProvider
-    DependsOn: MyWaitCondition2
+    DependsOn:
+    - AirflowECSAutoScalingGroup
+    - MyWaitCondition2
     Properties:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref AirflowECSAutoScalingGroup
