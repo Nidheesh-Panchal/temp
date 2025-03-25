@@ -4,11 +4,6 @@ Metadata:
     ParameterGroups:
 
     - Label:
-        default: Cloudformation Role Setup
-      Parameters:
-      - CloudFormationRoleArn
-
-    - Label:
         default: Pipeline components
       Parameters:
       - DisableTech
@@ -103,13 +98,6 @@ Metadata:
       - DbPassword
 
 Parameters:
-
-  CloudFormationRoleArn:
-    Type: String
-    Description: Cloud formation Role ARN that will be used to create the current stack
-    AllowedPattern: ^arn:aws:iam::[0-9]*:role\/[a-zA-Z0-9:\/_-]+$
-    MinLength: 13
-    ConstraintDescription: The value must be a valid ARN
 
   DisableTech:
     Type: String
@@ -562,8 +550,43 @@ Resources:
             - /
             - !Ref AWS::StackId
 
+  CloudFormationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: cloudformation.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: !Sub "${AWS::StackName}-AllowECS"
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecs:*
+            - ec2:*
+            - ecr:*
+            - autoscaling:*
+            - elasticloadbalancing:*
+            - cloudformation:*
+            - iam:*
+            - lambda:*
+            - logs:*
+            - route53:*
+            - s3:*
+            - servicediscovery:*
+            - ssm:GetParameters
+            - cloudwatch:*
+            - events:*
+            Resource: '*'
+
   LambdaRole:
     Type: AWS::IAM::Role
+    DependsOn: CloudFormationRole
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
@@ -589,7 +612,7 @@ Resources:
           - Effect: Allow
             Action:
             - iam:PassRole
-            Resource: !Ref CloudFormationRoleArn
+            Resource: !GetAtt CloudFormationRole.Arn
       ManagedPolicyArns:
       - arn:aws:iam::aws:policy/AmazonS3FullAccess
       - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
@@ -874,12 +897,7 @@ Resources:
                 if not isinstance(template_url, str):
                     raise ValueError("template_url must be a string")
 
-                parameters = [
-                    {
-                        'ParameterKey': 'CloudFormationRoleArn',
-                        'ParameterValue': role_arn
-                    }
-                ]
+                parameters = []
                 capabilities = [
                     'CAPABILITY_IAM',
                     'CAPABILITY_NAMED_IAM',
@@ -1733,12 +1751,12 @@ Resources:
           AIRFLOW_BASE_URL: !Sub "http://${AirflowLoadBalancer.DNSName}:8080"
           AIRFLOW_USERNAME: !Ref AirflowUsername
           AIRFLOW_PASSWORD: !Ref AirflowPassword
-          ROLE_ARN: !Ref CloudFormationRoleArn
+          ROLE_ARN: !GetAtt CloudFormationRole.Arn
       Events:
         Schedule1:
           Type: Schedule
           Properties:
-            Schedule: rate(1 minute)
+            Schedule: rate(10 minutes)
 
   autoUpdateStackLogGroup:
     Type: AWS::Logs::LogGroup
